@@ -1,0 +1,30 @@
+# === データ・DB（履歴に含めない） ===
+data/
+*.duckdb
+*.duckdb.wal
+*.wal
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# === 生成物（毎回のスクリーニングで上書きされる出力） ===
+screen_result.csv
+screen_result.html
+screen_result.png
+
+# === ログ ===
+*.log
+scheduler_log.txt
+
+# === 秘密情報 ===
+.env
+
+# === OS / エディタ ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
