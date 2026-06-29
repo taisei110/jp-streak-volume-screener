@@ -10,10 +10,11 @@ CLIによる夜間自動実行（取得 → 抽出 → レポート生成 → Di
   <img alt="DuckDB" src="https://img.shields.io/badge/DuckDB-analytics-FFF000?logo=duckdb&logoColor=black">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green">
   <img alt="CI" src="https://github.com/taisei110/jp-streak-volume-screener/actions/workflows/ci.yml/badge.svg">
+  <a href="https://jp-streak-volume-screener-110.streamlit.app/"><img alt="Live Demo" src="https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?logo=streamlit&logoColor=white"></a>
 </p>
 
-> **▶ ライブデモ**: https://your-app-name.streamlit.app  ←（Streamlit Cloud デプロイ後にURLを記載）
-> 同梱のサンプル株価データ（主要444銘柄）で、実際の操作感をそのまま試せます。
+> **▶ ライブデモ: https://jp-streak-volume-screener-110.streamlit.app/**
+> 同梱のサンプル株価データ（主要444銘柄）で、実際の操作感をそのまま試せます（インストール不要）。
 
 ![スクリーニング結果レポート](docs/screenshot_report.png)
 
