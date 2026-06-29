@@ -1,0 +1,6 @@
+# CLI版(jp_streak_volume_screener.py)で「Discord通知」「常駐モード」まで使う場合の追加依存。
+# 公開アプリ(app.py)だけなら requirements.txt のみでよい。
+-r requirements.txt
+requests        # Discord Webhook送信
+schedule        # --daemon(平日20:00の常駐自動実行)
+html2image      # 結果HTMLを画像化してDiscordに添付(Chrome/Chromium本体が別途必要)

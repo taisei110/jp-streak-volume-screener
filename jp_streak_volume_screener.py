@@ -22,9 +22,12 @@
 
 使い方:
   pip install yfinance duckdb pandas openpyxl xlrd schedule requests html2image jpholiday
-  python jp_streak_volume_screener.py            # 1回だけ実行(タスクスケジューラ向き・推奨)
-  python jp_streak_volume_screener.py --no-fetch # 取得せず既存DBで抽出のみ
+  python jp_streak_volume_screener.py            # 出来高版を1回実行(タスクスケジューラ向き・推奨)
+  python jp_streak_volume_screener.py --metric=turnover  # 売買代金版で実行(出力は *_turnover.*)
+  python jp_streak_volume_screener.py --no-fetch # 取得せず既存DBで抽出のみ(--metric併用可)
   python jp_streak_volume_screener.py --daemon    # 常駐し平日20:00に自動実行
+  ※ 出来高版と売買代金版はDBを共有するので、毎晩両方回す場合は
+    1本目は通常実行、2本目は --no-fetch --metric=turnover で取得を省ける。
   ※ requests/html2image はDiscord通知用、jpholidayは祝日スキップ用。いずれも任意。
     html2image は画像化にChrome/Chromium本体が必要(未導入ならテキストのみ通知)。
 
@@ -47,20 +50,12 @@ import os
 import time
 import sys
 import subprocess
+from dataclasses import dataclass
 import duckdb
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 from pathlib import Path
-
-# 進捗ログを行単位で即時に書き出す。パイプ/リダイレクト時はPythonが標準出力を
-# ブロックバッファリングするため、処理中に何も表示されず「固まった」ように見える。
-# 行バッファリングにすると各チャンクの進捗がそのつど見えるようになる。
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
 
 # ============================================================
 # 設定
@@ -77,6 +72,8 @@ MIN_TURNOVER = 0       # 流動性フィルタ(代金): 連騰前の平常時売
 FETCH_PERIOD = "6mo"   # yfinanceで取得する期間。連騰+基準中央値判定に十分な長さ
 CHUNK_SIZE  = 100      # yf.download を一度に投げる銘柄数(レート制限対策)
 SLEEP_SEC   = 1.0      # チャンク間の待機秒(IPブロック回避)
+DB_LOCK_RETRIES  = 5   # DBが他プロセス(アプリの取得等)にロックされている時の再試行回数
+DB_LOCK_WAIT_SEC = 30  # 再試行の間隔(秒)
 
 # ランキング: 出来高の勢い(min_ratio) と 価格の勢い(連騰中の上昇率) を
 # それぞれ母集団内のパーセンタイル順位に変換し、加重平均してスコア化する。
@@ -86,6 +83,45 @@ W_RISE = 0.5           # 価格の勢いの重み
 
 DB_PATH      = os.path.join("data", "prices.duckdb")
 UNIVERSE_CSV = "tickers.csv"   # コード列を持つCSVがあればこれを優先して使う
+# ============================================================
+# 指標切替: "volume"=出来高(株数) / "turnover"=売買代金(終値×出来高, 円)
+# コマンドラインで --metric=turnover を付けると売買代金版として動く(設定より優先)。
+# 売買代金は株価上昇自体が代金を押し上げるため出来高より通りやすい。閾値は別に持つ。
+# ============================================================
+METRIC = "volume"
+TURNOVER_VOL_MULT       = 1.5   # 売買代金版のtier1閾値(出来高版のVOL_MULTに相当)
+TURNOVER_VOL_MULT_SHORT = 2.5   # 売買代金版のtier2足切り(同VOL_MULT_SHORTに相当)
+
+
+@dataclass(frozen=True)
+class ScreenConfig:
+    """スクリーニング設定。既定値はモジュール冒頭の定数(import時点の値)。
+    frozen(ハッシュ可能)にしておくとアプリ側でキャッシュキーとして使える。"""
+    metric: str = METRIC
+    streak_min: int = STREAK_MIN
+    streak_top: int = STREAK_TOP
+    base_window: int = BASE_WINDOW
+    vol_mult: float = VOL_MULT
+    vol_mult_short: float = VOL_MULT_SHORT
+    turnover_vol_mult: float = TURNOVER_VOL_MULT
+    turnover_vol_mult_short: float = TURNOVER_VOL_MULT_SHORT
+    vol_mode: str = VOL_MODE
+    min_volume: float = MIN_VOLUME
+    min_turnover: float = MIN_TURNOVER
+    w_vol: float = W_VOL
+    w_rise: float = W_RISE
+
+
+def config_from_globals():
+    """モジュール定数(--metric反映後)から ScreenConfig を組み立てる。CLI経路用。"""
+    return ScreenConfig(
+        metric=METRIC, streak_min=STREAK_MIN, streak_top=STREAK_TOP,
+        base_window=BASE_WINDOW, vol_mult=VOL_MULT, vol_mult_short=VOL_MULT_SHORT,
+        turnover_vol_mult=TURNOVER_VOL_MULT, turnover_vol_mult_short=TURNOVER_VOL_MULT_SHORT,
+        vol_mode=VOL_MODE, min_volume=MIN_VOLUME, min_turnover=MIN_TURNOVER,
+        w_vol=W_VOL, w_rise=W_RISE,
+    )
+
 OUTPUT_CSV   = "screen_result.csv"
 OUTPUT_HTML  = "screen_result.html"
 OUTPUT_PNG   = "screen_result.png"
@@ -130,6 +166,37 @@ def get_universe():
 # ============================================================
 # 2. 株価取得 -> DuckDB 保存
 # ============================================================
+def _is_lock_error(e):
+    """DuckDBのファイルロック競合による接続失敗かどうかを判定する。
+    OS由来の文言はロケールで変わる(日本語Windowsは「使用中」)ため複数パターンで見る。"""
+    msg = str(e).lower()
+    return ("lock" in msg or "being used" in msg
+            or "already open" in msg or "使用中" in msg)
+
+
+def connect_db_with_retry(path=None, retries=DB_LOCK_RETRIES, wait_sec=DB_LOCK_WAIT_SEC):
+    """read-write接続を返す。他プロセスがロック中なら待って再試行し、
+    最終的に失敗したらログとDiscordに通知して例外を上げる。"""
+    path = path or DB_PATH
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            return duckdb.connect(path)
+        except duckdb.Error as e:
+            if not _is_lock_error(e):
+                raise
+            last = e
+            print(f"[db] DBがロック中で接続できません({attempt}/{retries}回目)。"
+                  f"{wait_sec}秒後に再試行します: {e}")
+            if attempt < retries:
+                time.sleep(wait_sec)
+    msg = (f"DBロックが解除されず接続を断念しました"
+           f"({retries}回試行/約{retries * wait_sec // 60}分待機): {last}")
+    print(f"[error] {msg}")
+    send_discord_error(msg)
+    raise last
+
+
 def fetch_to_db(codes, con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS prices(
@@ -147,10 +214,7 @@ def fetch_to_db(codes, con):
         "group_by": "ticker",
         "auto_adjust": True,
         "threads": True,
-        "progress": False,
-        # 1リクエストあたりの上限秒。これが無いとYahooの接続スタンドやレート制限時に
-        # ソケットが応答待ちのまま無限ハングし、スクリプト全体が何時間も止まる。
-        "timeout": 30,
+        "progress": False
     }
 
     if max_date_val:
@@ -166,6 +230,13 @@ def fetch_to_db(codes, con):
     else:
         fetch_kwargs["period"] = FETCH_PERIOD
         print(f"[fetch] 新規取得: 全期間({FETCH_PERIOD})を取得します")
+
+    # 大引け前に実行された場合、yfinanceは当日の「ザラ場途中の値」を返す。
+    # 不完全なバーを保存するとランキング・通知が誤った値で生成されるため、
+    # 16時前の実行では当日分を保存対象から除外する(夜の定時実行では当日分が入る)。
+    skip_today = datetime.now().hour < 16
+    if skip_today:
+        print(f"[fetch] 大引け前のため当日({today})分は保存しません(確定値は夜の実行で取得)")
 
     tickers = [c + ".T" for c in codes]
     total = len(tickers)
@@ -188,6 +259,8 @@ def fetch_to_db(codes, con):
                 continue
             sub = sub.dropna(subset=["Close", "Open", "Volume"])
             for d, row in sub.iterrows():
+                if skip_today and d.date() >= today:
+                    continue
                 recs.append((code, d.date(), float(row["Open"]),
                              float(row["Close"]), int(row["Volume"])))
 
@@ -204,7 +277,36 @@ def fetch_to_db(codes, con):
 # ============================================================
 # 3. スクリーニング (検証済みSQL)
 # ============================================================
-def screen(con):
+def metric_cfg(cfg=None):
+    """指標(出来高/売買代金)に応じた式・閾値・表示ラベルを返す。
+    cfg省略時はモジュール定数から組み立てる(既存呼び出しの互換維持)。"""
+    if cfg is None:
+        cfg = config_from_globals()
+    if cfg.metric == "turnover":
+        return {
+            "expr": "(f.close * f.volume)",
+            "mult": cfg.turnover_vol_mult,
+            "mult_short": cfg.turnover_vol_mult_short,
+            "label": "売買代金",
+            "unit": "百万円",
+            "div": 1e6,   # 表示用除数(円→百万円)
+            "suffix": "_turnover",
+        }
+    return {
+        "expr": "f.volume",
+        "mult": cfg.vol_mult,
+        "mult_short": cfg.vol_mult_short,
+        "label": "出来高",
+        "unit": "株",
+        "div": 1,
+        "suffix": "",
+    }
+
+
+def screen(con, cfg=None):
+    if cfg is None:
+        cfg = config_from_globals()
+    mc = metric_cfg(cfg)
     sql = f"""
     WITH daily AS (
       SELECT code, date, open, close, volume,
@@ -224,45 +326,49 @@ def screen(con):
       GROUP BY code
     ),
     metrics AS (
-      -- 連騰中(rn<=streak_len)と基準期間(連騰初日の前日以前BASE_WINDOW日)を連騰長に合わせて集計
+      -- 連騰中(rn<=streak_len)と基準期間(連騰初日の前日以前BASE_WINDOW日)を連騰長に合わせて集計。
+      -- 乖離判定の指標は {mc['label']}。流動性フィルタ用に出来高・売買代金の基準中央値も別に持つ。
       SELECT f.code, s.streak_len,
-        AVG(CASE WHEN f.rn <= s.streak_len THEN f.volume END) AS avg_vol,
-        MIN(CASE WHEN f.rn <= s.streak_len THEN f.volume END) AS min_vol,
-        MEDIAN(f.volume) FILTER (
-          WHERE f.rn BETWEEN s.streak_len + 1 AND s.streak_len + {BASE_WINDOW}
+        AVG(CASE WHEN f.rn <= s.streak_len THEN {mc['expr']} END) AS avg_m,
+        MIN(CASE WHEN f.rn <= s.streak_len THEN {mc['expr']} END) AS min_m,
+        MEDIAN({mc['expr']}) FILTER (
+          WHERE f.rn BETWEEN s.streak_len + 1 AND s.streak_len + {cfg.base_window}
         ) AS base_med,
+        MEDIAN(f.volume) FILTER (
+          WHERE f.rn BETWEEN s.streak_len + 1 AND s.streak_len + {cfg.base_window}
+        ) AS base_vol_med,
         MEDIAN(f.close * f.volume) FILTER (
-          WHERE f.rn BETWEEN s.streak_len + 1 AND s.streak_len + {BASE_WINDOW}
+          WHERE f.rn BETWEEN s.streak_len + 1 AND s.streak_len + {cfg.base_window}
         ) AS base_turnover,
         MAX(CASE WHEN f.rn = 1 THEN f.date END)  AS last_date,
         MAX(CASE WHEN f.rn = 1 THEN f.close END) AS last_close,
         MAX(CASE WHEN f.rn = s.streak_len + 1 THEN f.close END) AS pre_close
       FROM flags f
       JOIN slen s USING (code)
-      WHERE s.streak_len >= {STREAK_MIN}
+      WHERE s.streak_len >= {cfg.streak_min}
       GROUP BY f.code, s.streak_len
     ),
     filtered AS (
       SELECT *,
         round((last_close - pre_close) / pre_close * 100, 2) AS rise_pct,
-        round(avg_vol / base_med, 2) AS avg_ratio,
-        round(min_vol / base_med, 2) AS min_ratio,
-        CASE WHEN streak_len >= {STREAK_TOP} THEN 1 ELSE 2 END AS tier
+        round(avg_m / base_med, 2) AS avg_ratio,
+        round(min_m / base_med, 2) AS min_ratio,
+        CASE WHEN streak_len >= {cfg.streak_top} THEN 1 ELSE 2 END AS tier
       FROM metrics
       WHERE base_med IS NOT NULL AND base_med > 0
         AND pre_close IS NOT NULL AND pre_close > 0
-        AND ({MIN_VOLUME} <= 0 OR base_med > {MIN_VOLUME})
-        AND ({MIN_TURNOVER} <= 0 OR base_turnover > {MIN_TURNOVER})
+        AND ({cfg.min_volume} <= 0 OR base_vol_med > {cfg.min_volume})
+        AND ({cfg.min_turnover} <= 0 OR base_turnover > {cfg.min_turnover})
         AND (
-          -- tier1 (STREAK_TOP日以上): 通常閾値 VOL_MULT
-          ( streak_len >= {STREAK_TOP} AND (
-              ('{VOL_MODE}' = 'avg' AND avg_vol >= base_med * {VOL_MULT})
-              OR ('{VOL_MODE}' = 'all' AND min_vol >= base_med * {VOL_MULT}) ) )
+          -- tier1 (STREAK_TOP日以上): 通常閾値
+          ( streak_len >= {cfg.streak_top} AND (
+              ('{cfg.vol_mode}' = 'avg' AND avg_m >= base_med * {mc['mult']})
+              OR ('{cfg.vol_mode}' = 'all' AND min_m >= base_med * {mc['mult']}) ) )
           OR
-          -- tier2 (STREAK_MIN以上STREAK_TOP未満): 厳しい閾値 VOL_MULT_SHORT
-          ( streak_len < {STREAK_TOP} AND (
-              ('{VOL_MODE}' = 'avg' AND avg_vol >= base_med * {VOL_MULT_SHORT})
-              OR ('{VOL_MODE}' = 'all' AND min_vol >= base_med * {VOL_MULT_SHORT}) ) )
+          -- tier2 (STREAK_MIN以上STREAK_TOP未満): 厳しい閾値
+          ( streak_len < {cfg.streak_top} AND (
+              ('{cfg.vol_mode}' = 'avg' AND avg_m >= base_med * {mc['mult_short']})
+              OR ('{cfg.vol_mode}' = 'all' AND min_m >= base_med * {mc['mult_short']}) ) )
         )
     ),
     ranked AS (
@@ -274,15 +380,15 @@ def screen(con):
     SELECT
       ROW_NUMBER() OVER (
         ORDER BY tier ASC,
-                 ({W_VOL} * pr_vol + {W_RISE} * pr_rise) DESC,
+                 ({cfg.w_vol} * pr_vol + {cfg.w_rise} * pr_rise) DESC,
                  rise_pct DESC, min_ratio DESC
       ) AS rank,
       code, streak_len, tier, last_date, last_close, rise_pct,
-      CAST(avg_vol AS BIGINT) AS avg_vol3,
-      min_vol AS min_vol3,
+      CAST(avg_m AS BIGINT) AS avg_vol3,
+      CAST(min_m AS BIGINT) AS min_vol3,
       CAST(base_med AS BIGINT) AS base_med,
       avg_ratio, min_ratio,
-      round({W_VOL} * pr_vol + {W_RISE} * pr_rise, 3) AS score
+      round({cfg.w_vol} * pr_vol + {cfg.w_rise} * pr_rise, 3) AS score
     FROM ranked
     ORDER BY rank
     """
@@ -297,6 +403,13 @@ def generate_html(res, data_period, run_time, stale_note=""):
     stale_note: 最新データが当日でない場合などの注意書き(空なら非表示)。"""
     n = len(res)
     base_date = str(res["last_date"].iloc[0]) if n > 0 else "N/A"
+    mcfg = metric_cfg()
+
+    def _fmt_m(v):
+        """指標値の表示。売買代金は百万円に換算して小数1桁、出来高は整数。"""
+        if mcfg["div"] > 1:
+            return f"{v / mcfg['div']:,.1f}"
+        return f"{int(v):,}"
 
     def _market_cls(m):
         m = str(m)
@@ -338,9 +451,9 @@ def generate_html(res, data_period, run_time, stale_note=""):
             f'<td>{streak_html}</td>'
             f'<td class="num">{r["last_close"]:,.0f}</td>'
             f'<td class="num rise"><span class="trend-up">▲</span> {r["rise_pct"]:.2f}%</td>'
-            f'<td class="num">{int(r["avg_vol3"]):,}</td>'
-            f'<td class="num">{int(r["min_vol3"]):,}</td>'
-            f'<td class="num" style="color:var(--text-muted)">{int(r["base_med"]):,}</td>'
+            f'<td class="num">{_fmt_m(r["avg_vol3"])}</td>'
+            f'<td class="num">{_fmt_m(r["min_vol3"])}</td>'
+            f'<td class="num" style="color:var(--text-muted)">{_fmt_m(r["base_med"])}</td>'
             f'<td class="num highlight-col">{r["avg_ratio"]:.2f}x</td>'
             f'<td class="num highlight-col">{r["min_ratio"]:.2f}x</td>'
             f'<td class="num"><div class="score-badge {sc}">{r["score"]:.3f}</div></td>'
@@ -363,7 +476,7 @@ def generate_html(res, data_period, run_time, stale_note=""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>連騰スクリーナー | {base_date}</title>
+<title>連騰・{mcfg['label']}スクリーナー | {base_date}</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {{
@@ -489,14 +602,14 @@ footer {{ text-align: center; margin-top: 40px; font-size: 13px; color: #52525b;
   
   {stale_html}
   <div class="header-glass">
-    <h1>\U0001f4c8 <span>連騰・出来高スクリーナー</span></h1>
+    <h1>\U0001f4c8 <span>連騰・{mcfg['label']}スクリーナー</span></h1>
     <div class="grid-stats">
       <div class="stat-card">
-        <div class="stat-label">条件(連騰日数 / 出来高閾値)</div>
-        <div class="stat-value" style="font-size:16px; margin-top:6px;">tier1: {STREAK_TOP}日↑×{VOL_MULT} / tier2: {STREAK_MIN}日×{VOL_MULT_SHORT}</div>
+        <div class="stat-label">条件(連騰日数 / {mcfg['label']}閾値)</div>
+        <div class="stat-value" style="font-size:16px; margin-top:6px;">tier1: {STREAK_TOP}日↑×{mcfg['mult']} / tier2: {STREAK_MIN}日×{mcfg['mult_short']}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">出来高判定モード</div>
+        <div class="stat-label">{mcfg['label']}判定モード</div>
         <div class="stat-value" style="color: #c084fc">{VOL_MODE.upper()}</div>
       </div>
       <div class="stat-card">
@@ -526,9 +639,9 @@ footer {{ text-align: center; margin-top: 40px; font-size: 13px; color: #52525b;
             <th>連騰</th>
             <th class="num">終値</th>
             <th class="num">上昇率</th>
-            <th class="num">平均出来高(連騰中)</th>
-            <th class="num">最小出来高(連騰中)</th>
-            <th class="num">基準中央値({BASE_WINDOW}日間)</th>
+            <th class="num">平均{mcfg['label']}(連騰中, {mcfg['unit']})</th>
+            <th class="num">最小{mcfg['label']}(連騰中, {mcfg['unit']})</th>
+            <th class="num">基準中央値({BASE_WINDOW}日間, {mcfg['unit']})</th>
             <th class="num">平均倍率</th>
             <th class="num">最小倍率</th>
             <th class="num">総合スコア</th>
@@ -555,23 +668,37 @@ footer {{ text-align: center; margin-top: 40px; font-size: 13px; color: #52525b;
 # ============================================================
 # 5. Discord通知
 # ============================================================
-def send_discord_notification(res, run_time, stale_note=""):
+def send_discord_notification(res, run_time, stale_note="", data_date=None):
     if not DISCORD_WEBHOOK_URL:
         print("[Discord] DISCORD_WEBHOOK_URL 未設定のため通知をスキップします")
         return
+
+    # 多重送信防止: 同じデータ基準日(data_date)は1回だけ送る（1日に複数回走っても重複しない）。
+    # 新しいデータ日になれば送る。強制送信は環境変数 DISCORD_FORCE_NOTIFY=1。
+    marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", ".discord_last_sent")
+    force = os.environ.get("DISCORD_FORCE_NOTIFY", "") in ("1", "true", "True")
+    if data_date is not None and not force:
+        try:
+            if os.path.exists(marker):
+                with open(marker, encoding="utf-8") as fmk:
+                    if fmk.read().strip() == str(data_date):
+                        print(f"[Discord] {data_date} は既に通知済みのため送信をスキップ（多重送信防止）")
+                        return
+        except OSError:
+            pass
 
     n = len(res)
     note_line = f"\n⚠️ {stale_note}" if stale_note else ""
 
     if n == 0:
         payload = {
-            "username": "連騰スクリーナーBot",
+            "username": f"連騰{metric_cfg()['label']}スクリーナーBot",
             "content": f"**📈 連騰・出来高スクリーニング ({run_time})**{note_line}\n今回は条件に合致する銘柄はありませんでした。"
         }
     else:
         # 埋め込みメッセージ (Embed) を作成して見やすくする
         embed = {
-            "title": f"📈 連騰・出来高ランキング (上位20銘柄)",
+            "title": f"📈 連騰・{metric_cfg()['label']}ランキング (上位20銘柄)",
             "description": f"**抽出日時**: {run_time}{note_line}\n**該当銘柄数**: {n} 件\n※より詳細な全データは、添付の「画像」をタップして拡大してご確認ください。",
             "color": 6345210,  # アクセントカラー (青紫色)
             "fields": []
@@ -587,13 +714,13 @@ def send_discord_notification(res, run_time, stale_note=""):
 
             field = {
                 "name": f"{medal} {rank}位 {r['code']} {r['name']} ({r.get('market', '')})",
-                "value": f"{tier_tag} {slen}日連騰\n📈 上昇率: **+{r['rise_pct']:.2f}%**\n📊 出来高: **{r['avg_ratio']:.1f}倍** (平均)",
+                "value": f"{tier_tag} {slen}日連騰\n📈 上昇率: **+{r['rise_pct']:.2f}%**\n📊 {metric_cfg()['label']}: **{r['avg_ratio']:.1f}倍** (平均)",
                 "inline": False
             }
             embed["fields"].append(field)
 
         payload = {
-            "username": "連騰スクリーナーBot",
+            "username": f"連騰{metric_cfg()['label']}スクリーナーBot",
             "embeds": [embed]
         }
 
@@ -631,12 +758,34 @@ def send_discord_notification(res, run_time, stale_note=""):
 
         if resp.status_code in (200, 204):
             print("[Discord] 通知を送信しました")
+            if data_date is not None:  # 送信成功時のみ基準日を記録（失敗時は次回再送）
+                try:
+                    os.makedirs(os.path.dirname(marker), exist_ok=True)
+                    with open(marker, "w", encoding="utf-8") as fmk:
+                        fmk.write(str(data_date))
+                except OSError:
+                    pass
         else:
             print(f"[Discord] 通知に失敗しました (ステータス: {resp.status_code})")
     except ImportError:
         print("[Discord] requests が未導入のため通知をスキップ: pip install requests")
     except Exception as e:
         print(f"[Discord] 通知処理中にエラーが発生しました: {e}")
+
+def send_discord_error(text):
+    """エラー文をDiscordに通知する(Webhook未設定・送信失敗時は何もしない)。"""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        import requests
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"username": "連騰スクリーナーBot", "content": f"🚨 {text}"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[Discord] エラー通知の送信に失敗: {e}")
+
 
 # ============================================================
 # 6. 実行
@@ -646,7 +795,7 @@ def run_once(do_fetch=True):
     os.makedirs("data", exist_ok=True)
     names, markets = get_universe()
 
-    con = duckdb.connect(DB_PATH)
+    con = connect_db_with_retry()
     if do_fetch:
         fetch_to_db(list(names.keys()), con)
     else:
@@ -670,18 +819,20 @@ def run_once(do_fetch=True):
         )
         print(f"[warn] {stale_note}")
 
-    res = screen(con)
+    cfg = config_from_globals()
+    res = screen(con, cfg)
     res["name"] = res["code"].map(names)
     res["market"] = res["code"].map(markets).fillna("")
     res = res[["rank", "code", "name", "market", "streak_len", "tier",
                "last_date", "last_close", "rise_pct",
                "avg_vol3", "min_vol3", "base_med", "avg_ratio", "min_ratio", "score"]]
 
+    mc = metric_cfg(cfg)
     n_tier1 = int((res["tier"] == 1).sum()) if len(res) else 0
     n_tier2 = int((res["tier"] == 2).sum()) if len(res) else 0
     print(f"\n=== 該当 {len(res)} 銘柄 "
-          f"(tier1: {STREAK_TOP}日以上×{VOL_MULT} = {n_tier1}件 / "
-          f"tier2: {STREAK_MIN}日×{VOL_MULT_SHORT} = {n_tier2}件 / 出来高[{VOL_MODE}]) "
+          f"(指標: {mc['label']} / tier1: {STREAK_TOP}日以上×{mc['mult']} = {n_tier1}件 / "
+          f"tier2: {STREAK_MIN}日×{mc['mult_short']} = {n_tier2}件 / 判定[{VOL_MODE}]) "
           f"tier→スコア降順 ===")
     pd.set_option("display.max_rows", None)
     print(res.to_string(index=False))
@@ -691,7 +842,7 @@ def run_once(do_fetch=True):
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     generate_html(res, data_period, run_time, stale_note)
 
-    send_discord_notification(res, run_time, stale_note)
+    send_discord_notification(res, run_time, stale_note, data_date=latest)
     con.close()
 
     # ▼ 日次処理の末尾フック: theme-flow（テーマ別資金フロー）の当日レポートを生成する。
@@ -758,12 +909,15 @@ def trigger_theme_flow(latest_date, today):
                   + (r2.stderr or "")[-1000:])
             return
 
-        # 生成HTMLのパスをログへ（daily_report は「出力: ....html」を標準出力に出す）
+        # 生成HTMLのパスをログへ（daily_report は「出力: ....html」を標準出力に出す）。
+        # Discord送信の成否行もここで透過させる(捨てると通知失敗に気づけないため)。
         html_path = None
         for line in (r2.stdout or "").splitlines():
             s = line.strip()
             if s.startswith("出力:") and s.endswith(".html"):
                 html_path = s.split("出力:", 1)[1].strip()
+            elif "Discord" in s:
+                print(s)
         if html_path:
             print(f"[theme-flow] レポート生成完了 → {html_path}")
         else:
@@ -775,7 +929,25 @@ def trigger_theme_flow(latest_date, today):
         print(f"[theme-flow] 生成中にエラー（ログのみ・本体は継続）: {e}")
 
 
+def apply_metric_from_argv():
+    """--metric=turnover / --turnover で売買代金版に切り替え、出力ファイル名を分ける。"""
+    global METRIC, OUTPUT_CSV, OUTPUT_HTML, OUTPUT_PNG
+    for a in sys.argv[1:]:
+        if a == "--turnover" or a == "--metric=turnover":
+            METRIC = "turnover"
+        elif a == "--metric=volume":
+            METRIC = "volume"
+    mc = metric_cfg()
+    sfx = mc["suffix"]
+    if sfx:
+        OUTPUT_CSV  = "screen_result_turnover.csv"
+        OUTPUT_HTML = "screen_result_turnover.html"
+        OUTPUT_PNG  = "screen_result_turnover.png"
+    print(f"[metric] 指標: {mc['label']} (閾値 tier1×{mc['mult']} / tier2×{mc['mult_short']})")
+
+
 def main():
+    apply_metric_from_argv()
     if "--daemon" in sys.argv:
         try:
             import schedule as sch

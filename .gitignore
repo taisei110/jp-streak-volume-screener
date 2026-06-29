@@ -3,6 +3,20 @@ data/
 *.duckdb
 *.duckdb.wal
 *.wal
+.discord_last_sent
+# 公開デモ用のサンプルデータだけは例外的に追跡する（実データは上記で除外のまま）
+!sample_data/
+!sample_data/prices.duckdb
+
+# === ローカルの銘柄ユニバースCSV（個人の保有リスト等が入りうるため除外） ===
+# ※同梱の sample_data/tickers.csv は対象外（ルート直下のみ無視）
+/tickers.csv
+
+# === 手元用の使い捨てスクリプト（公開リポジトリには含めない） ===
+check_data.py
+test_img.py
+# 個人環境専用のスケジューラ起動ラッパー（絶対パス直書き）。公開版は run_daily.bat を使う
+run.bat
 
 # === Python ===
 __pycache__/
@@ -23,8 +37,10 @@ scheduler_log.txt
 # === 秘密情報 ===
 .env
 
-# === OS / エディタ ===
+# === OS / エディタ / ツール ===
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+.claude/
+.pytest_cache/
